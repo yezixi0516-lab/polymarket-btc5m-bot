@@ -1,0 +1,204 @@
+# This project is paper-trading only. Do not put a Polymarket private key here.
+PAPER_STARTING_CASH=1000
+PAPER_TRADE_USD=5
+MAX_DAILY_NOTIONAL=25
+MAX_DAILY_LOSS=10
+MAX_OPEN_POSITIONS=1
+MIN_EDGE=0.06
+ESTIMATED_COST=0.02
+POLL_INTERVAL_SECONDS=5
+MIN_PRICE_SAMPLES=12
+
+# Candidate-feature weights. They intentionally start at zero until each
+# feature has passed the out-of-sample research gate.
+BASELINE_WEIGHT=1
+MACD_WEIGHT=0
+RSI_WEIGHT=0
+BOLLINGER_WEIGHT=0
+BREAKOUT_WEIGHT=0
+MARKET_MID_WEIGHT=0
+
+__pycache__/
+*.py[cod]
+.venv/
+data/*.sqlite3
+data/*.sqlite3-*
+
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-btc5m-paperbot"
+version = "0.1.0"
+description = "Paper-trading research bot for Polymarket Bitcoin 5-minute markets"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+# Polymarket BTC 5m 研究与模拟交易程序
+
+这是一个**只读行情 + 模拟成交**的 Python 原型，用来研究 Polymarket 上的 BTC 五分钟涨跌市场。它没有真实下单、钱包或私钥功能；所有仓位都记录在本地 SQLite 文件中。
+
+## 它做什么
+
+- 从 Polymarket Gamma API 自动筛选活跃的 BTC 五分钟二元市场；
+- 从 CLOB API 读取 Up / Down 结果代币的最优买卖价；
+- 从 Coinbase 公共行情读取 BTC-USD 现价；
+- 仅在市场开盘后的短窗口记录一个观察到的参考价，并用现货价格、短期实现波动率和剩余时间计算上涨概率；
+- 只有预估优势覆盖设定的成本与安全边际时，才在模拟账户中开仓；
+- 记录 MACD、RSI、布林带、突破和 CLOB 中间价等候选信号，供后续单独检验与组合；
+- 在 SQLite 中保存行情、决策、模拟成交和风险控制结果，便于之后回放与校准；
+- 可将已由 Polymarket 结算的模拟仓位标记为赢或输并写入 PnL。
+
+## 重要限制
+
+这个版本是研究工具，不是盈利承诺，也不应直接用于真实资金。Polymarket 每个市场的结算规则、参考指数和开盘基准必须以该市场的原始说明为准。本程序的参考价来自开盘附近的 Coinbase 观测值，因此只能作为研究近似；若与结算来源不一致，就不应据此实盘交易。
+
+程序默认在市场开盘后 15 秒以内才建立参考价；如果中途才启动，它会只记录数据、不交易，直到下一轮市场。这样可避免悄悄用错误的“开盘价”生成信号。
+
+## 运行
+
+需要 Python 3.11 或以上，不依赖第三方包。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+python -m btc5m_bot --once
+```
+
+持续观测：
+
+```powershell
+python -m btc5m_bot --watch
+```
+
+结算已结束的模拟仓位：
+
+```powershell
+python -m btc5m_bot --settle
+```
+
+默认数据库在 `data/paperbot.sqlite3`。可以用环境变量调低风险限额，例如：
+
+```powershell
+$env:PAPER_TRADE_USD = "2"
+$env:MAX_DAILY_NOTIONAL = "10"
+python -m btc5m_bot --watch
+```
+
+候选信号默认只记录、不改变交易决策。只有某个信号通过样本外检验后，才为它设置正权重。例如：
+
+```powershell
+$env:MACD_WEIGHT = "0.15"
+$env:RSI_WEIGHT = "0.10"
+python -m btc5m_bot --watch
+```
+
+不要在没有已结算样本和预先定义验证门槛的情况下启用这些权重。
+
+运行离线测试：
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## 风控默认值
+
+- 初始模拟资金：1,000 pUSD
+- 单笔模拟名义金额：5 pUSD
+- 单日最大新开仓名义金额：25 pUSD
+- 单日已实现最大亏损：10 pUSD（触发后停止新增模拟仓位）
+- 最大未结算模拟仓位：1
+- 开仓信号要求：模型优势至少 6%，其中已预留 2% 的费用和滑点估计
+- 剩余时间少于 45 秒或多于 240 秒时不新开仓
+
+这些数值用于限制研究环境的错误，不代表适合真实交易。真实交易前应单独完成：市场结算源对齐、历史数据回放、费用模型校验、地理可用性检查、密钥隔离和人工审批流程。
+
+完整的样本外验证、特征记录和上线门槛见 [RESEARCH_PROTOCOL.md](RESEARCH_PROTOCOL.md)。当前概率模型只是一个透明的单信号基线，不应被视为已经验证的交易策略。
+
+来自十个外部量化项目的适配取舍见 [STRATEGY_ADAPTATION.md](STRATEGY_ADAPTATION.md)。
+
+# BTC 五分钟预测市场：研究协议
+
+本文件定义这个模拟程序何时可以从“收集数据”升级到“评估策略”。它不授权真实下单。
+
+## 1. 先验证结算定义
+
+每一个市场必须保存原始问题、完整结算说明、开始与结束时刻、官方参考价格来源和实际结果。只有当外部价格源与市场结算源完全一致时，才能把它用于概率模型。
+
+当前程序用 Coinbase 开盘附近的观察值建立研究参考价，只适合验证程序管道；它不是最终结算基准。
+
+## 2. 记录可复现的特征
+
+对每一次决策保存至少以下内容：
+
+- 剩余时间、官方基准价、当前 BTC 价格和短期实现波动率；
+- Up 与 Down 的最优买卖价、价差、可成交深度、成交与取消订单；
+- 数据时间戳与本机决策时间，用于测量延迟；
+- 当时的模型概率、每个子信号、成本估计和是否实际模拟成交；
+- 最终结算结果、模拟收益、实际可成交收益与未成交原因。
+
+单一信号只能作为基线。下一阶段会分别测试价格偏离、短期动量、波动率状态和盘口失衡，再只组合样本外仍有效且低相关的信号。
+
+## 3. 样本外验证门槛
+
+不要用同一批市场同时调参数和宣布策略有效。按时间切分训练、验证和最终保留集；参数只在前两个区间确定。
+
+至少报告：
+
+- 概率预测：Brier score、对数损失和校准曲线；
+- 交易表现：每笔净期望值、成交率、平均滑点、最大回撤、收益波动和日度 PnL；
+- 对照：买入市场中间价、随机方向、以及不交易；
+- 显著性：策略变体很多时，应用多重检验控制或置换检验。
+
+在数量足够的已结算样本、成本后样本外优势和稳定的回撤表现出现之前，结论只能是“假设”，不能是“策略”。
+
+## 4. 执行与风险
+
+Polymarket 是中央限价订单簿。评估必须按最优可成交价而非中间价计算，并把价差、部分成交、撤单、网络延迟和市场临近结算时的流动性变化计入成本。
+
+模拟阶段采用固定的小额名义仓位。只有在模型经过样本外校准后，才研究带参数不确定性折减的分数凯利仓位；永远不使用满凯利或马丁格尔。程序还应限制单场、单日和相关市场的总风险。
+
+## 5. 上线条件
+
+真实执行是独立项目，至少需要人工审批、地区可用性检查、专用小额热钱包、密钥隔离、限价单与撤单逻辑、异常熔断、审计日志和全天候告警。任何一项未完成，都保持模拟模式。
+
+
+# 十个量化项目的适配取舍
+
+来源仓库 `yezixi0516-lab/quant-strategies-pack` 当前是一个来源目录和元数据加载器；它没有包含十个上游项目的策略源码，回测引擎也还是占位实现。因此，本项目不会安装该包、不会复制其宣称的回测能力，也不会把它视为已验证策略。
+
+我们只借鉴与 BTC 五分钟二元市场有明确对应关系的研究思想，并在本项目内从零实现、独立验证。
+
+## 纳入候选信号层
+
+- `quant-trading`：MACD、RSI、布林带和突破类指标作为独立候选特征。它们不会默认影响下单，必须先完成样本外检验。
+- `howtrader`、`trading-strategy`：借鉴“数据源与执行层分离”的工程思路；本项目继续只使用 Polymarket 的公开市场数据和本地模拟账户。
+- `trading-with-python`、`Quantitative-Notebooks`、Apress 教材代码：借鉴研究、统计检验和风险度量方法，而不是直接复用资产类别不匹配的参数。
+- `algo_trading_and_quant_strategies`：保留均值回归与统计套利作为研究方向；配对交易不适用于单一 BTC 五分钟二元合约，暂不实现。
+
+## 明确不直接采用
+
+- `Options-Trading-Strategies-in-Python`：跨式、铁鹰等依赖期权行权价、隐含波动率和到期结构，不能直接映射成单个 Up/Down 合约。
+- `awesome-quant-ai`：这是资源集合，不是可执行策略。
+- 网格交易、通用现货交易、DEX 流动性池策略：市场机制和风险函数不同，不应硬套到 Polymarket CLOB。
+- 任何上游回测中的零滑点、零费用、日线参数或未来数据假设。
+
+## 当前融合方式
+
+程序将每次决策的候选信号写入 SQLite 的 `decisions.signals_json` 字段：
+
+- `baseline_probability`：当前价格相对开盘参考价、波动率和剩余时间的基础概率；
+- `macd_probability`：短期趋势候选；
+- `rsi_mean_reversion_probability`：超买/超卖后的反转候选；
+- `bollinger_mean_reversion_probability`：偏离滚动区间后的反转候选；
+- `breakout_probability`：突破近期区间的趋势候选；
+- `market_mid_probability`：CLOB 双边中间价推导的市场先验。
+
+默认只有 `baseline_probability` 的权重为 1；其余权重均为 0。这确保“融会贯通”是可审计的研究框架，而不是把互相矛盾的指标简单投票。每个特征通过时间切分的样本外评估、成本后净收益评估和相关性检查后，才允许以很小权重参与组合。
